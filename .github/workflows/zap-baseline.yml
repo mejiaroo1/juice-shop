@@ -1,0 +1,157 @@
+name: ZAP Baseline — Juice Shop Lab
+
+# CPS-5981 Chapter 1 lab: passive OWASP ZAP baseline scan of an ephemeral,
+# locally started Juice Shop container. Adapted from the course lab YAML with
+# the following deliberate changes (all documented in the submission README):
+#   * Fork default branch is "master" (upstream Juice Shop), not "main".
+#   * Juice Shop is built from THIS checkout so a code fix in the fork is what
+#     gets scanned; the upstream image is available as an opt-out.
+#   * Third-party actions are pinned to reviewed commit SHAs.
+#   * Manual runs choose observation vs enforcement; pull-request checks always
+#     enforce the version-controlled policy in .zap/rules.tsv.
+#   * zap-baseline.py runs with -I so only FAIL-level policy decisions block the
+#     job. WARN stays visible in the report but is not release-blocking.
+
+on:
+  pull_request:
+    branches: [ master ]
+  push:
+    branches: [ master, security/zap-baseline ]
+  workflow_dispatch:
+    inputs:
+      spider_minutes:
+        description: "Spider duration in minutes"
+        required: true
+        default: "2"
+      enforce_gate:
+        description: "Fail the job when the rule policy returns FAIL-level alerts"
+        type: boolean
+        required: true
+        default: false
+      build_from_source:
+        description: "Build Juice Shop from this checkout (false = pull the upstream image)"
+        type: boolean
+        required: true
+        default: true
+
+# Least privilege: the job only needs to read the repository. No issue writing,
+# no package or deployment permissions.
+permissions:
+  contents: read
+
+concurrency:
+  group: zap-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---------------------------------------------------------------- CONFIGURATION
+  TARGET_URL: http://127.0.0.1:3000
+  JUICE_SHOP_IMAGE: bkimminich/juice-shop:latest
+  RULES_FILE: .zap/rules.tsv
+  ARTIFACT_NAME: zap-baseline-report
+  SPIDER_MINUTES: ${{ inputs.spider_minutes || '2' }}
+  ZAP_TIMEOUT_MINUTES: "10"
+  # Manual runs default to source build; push/PR events always build from source.
+  BUILD_FROM_SOURCE: ${{ github.event_name != 'workflow_dispatch' || inputs.build_from_source == true }}
+  # Pull-request checks always enforce the committed policy; manual runs opt in.
+  ENFORCE_GATE: ${{ github.event_name == 'pull_request' || inputs.enforce_gate == true }}
+  # -------------------------------------------------------------------------------
+
+jobs:
+  zap-baseline:
+    name: zap-baseline
+    runs-on: ubuntu-latest
+    # Source build (Angular frontend + TypeScript server) takes ~10-15 minutes
+    # before the 2-minute spider and passive scan start.
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve target image
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_FROM_SOURCE" = "true" ]; then
+            echo "Building Juice Shop from checkout $GITHUB_SHA"
+            docker build \
+              --build-arg VCS_REF="$GITHUB_SHA" \
+              --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              -t juice-shop:lab .
+            echo "IMAGE=juice-shop:lab" >> "$GITHUB_ENV"
+          else
+            echo "Pulling declared image $JUICE_SHOP_IMAGE"
+            docker pull "$JUICE_SHOP_IMAGE"
+            echo "IMAGE=$JUICE_SHOP_IMAGE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start Juice Shop
+        run: |
+          docker run -d --rm --name juice-shop -p 3000:3000 "$IMAGE"
+
+      - name: Wait for Juice Shop
+        run: |
+          for _ in {1..30}; do
+            if curl -fsS "$TARGET_URL" >/dev/null; then
+              echo "Juice Shop is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs juice-shop
+          exit 1
+
+      - name: Record tested revision
+        run: |
+          set -euo pipefail
+          IMAGE_ID="$(docker inspect --format '{{.Id}}' "$IMAGE")"
+          RULES_SHA="$(sha256sum "$RULES_FILE" | cut -d' ' -f1)"
+          {
+            echo "## Tested revision"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Commit SHA | \`$GITHUB_SHA\` |"
+            echo "| Ref | \`$GITHUB_REF\` |"
+            echo "| Event | \`$GITHUB_EVENT_NAME\` |"
+            echo "| Target | \`$TARGET_URL\` |"
+            echo "| Image | \`$IMAGE\` (\`$IMAGE_ID\`) |"
+            echo "| Built from source | \`$BUILD_FROM_SOURCE\` |"
+            echo "| Rule policy | \`$RULES_FILE\` sha256 \`$RULES_SHA\` |"
+            echo "| Gate enforced | \`$ENFORCE_GATE\` |"
+            echo "| Spider minutes | \`$SPIDER_MINUTES\` |"
+            echo ""
+            echo "### Rule policy applied"
+            echo ""
+            echo '```'
+            cat "$RULES_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run ZAP baseline
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: ${{ env.TARGET_URL }}
+          rules_file_name: ${{ env.RULES_FILE }}
+          # -a  include alpha passive rules
+          # -m  spider minutes
+          # -T  max minutes for ZAP to start and finish passive scanning
+          # -I  do not return failure on WARN; only FAIL policy decisions block
+          # -c  rule policy. Passed explicitly because action-baseline v0.15.0 only
+          #     forwards rules_file_name to zap-baseline.py when the file contains
+          #     an IGNORE row; a WARN/FAIL-only policy is otherwise silently dropped
+          #     (verified in run 35016952701: docker command had no -c argument).
+          cmd_options: >-
+            -a -m ${{ env.SPIDER_MINUTES }} -T ${{ env.ZAP_TIMEOUT_MINUTES }} -I
+            -c ${{ env.RULES_FILE }}
+          fail_action: ${{ env.ENFORCE_GATE }}
+          allow_issue_writing: false
+          artifact_name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Show target diagnostics on failure
+        if: failure()
+        run: docker logs juice-shop
+
+      - name: Stop Juice Shop
+        if: always()
+        run: docker stop juice-shop || true

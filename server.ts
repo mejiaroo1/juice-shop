@@ -187,6 +187,29 @@ function configureApp (app: ReturnType<typeof express>, seq: typeof sequelize) {
   app.use(helmet.frameguard())
   // app.use(helmet.xssFilter()); // = no protection from persisted XSS via RESTful API
   app.disable('x-powered-by')
+  /* Content-Security-Policy baseline (CPS-5981 lab remediation for ZAP rule 10038).
+     The directives are scoped to what the Angular SPA and its assets actually load
+     (self, Google Fonts, data:/blob: media, websocket to self). 'unsafe-inline' is
+     required by the inline cookie-consent bootstrap in frontend/src/index.html and is
+     recorded as accepted residual risk in the lab finding register. Routes that set
+     their own policy (e.g. /profile) still override this header. */
+  app.use(helmet.contentSecurityPolicy({
+    useDefaults: false,
+    directives: {
+      defaultSrc: ["'self'"],
+      baseUri: ["'self'"],
+      objectSrc: ["'none'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      mediaSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      connectSrc: ["'self'", 'ws:', 'wss:', 'https:'],
+      frameSrc: ["'self'", 'https:'],
+      frameAncestors: ["'self'"],
+      formAction: ["'self'"]
+    }
+  }))
   app.use(featurePolicy({
     features: {
       payment: ["'self'"]
