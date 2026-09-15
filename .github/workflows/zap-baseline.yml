@@ -137,8 +137,13 @@ jobs:
           # -m  spider minutes
           # -T  max minutes for ZAP to start and finish passive scanning
           # -I  do not return failure on WARN; only FAIL policy decisions block
+          # -c  rule policy. Passed explicitly because action-baseline v0.15.0 only
+          #     forwards rules_file_name to zap-baseline.py when the file contains
+          #     an IGNORE row; a WARN/FAIL-only policy is otherwise silently dropped
+          #     (verified in run 35016952701: docker command had no -c argument).
           cmd_options: >-
             -a -m ${{ env.SPIDER_MINUTES }} -T ${{ env.ZAP_TIMEOUT_MINUTES }} -I
+            -c ${{ env.RULES_FILE }}
           fail_action: ${{ env.ENFORCE_GATE }}
           allow_issue_writing: false
           artifact_name: ${{ env.ARTIFACT_NAME }}
